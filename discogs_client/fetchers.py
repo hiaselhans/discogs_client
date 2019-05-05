@@ -5,6 +5,7 @@ from oauthlib import oauth1
 import json
 import os
 import re
+import time
 try:
     # python2
     from urlparse import parse_qsl
@@ -14,13 +15,27 @@ except ImportError:
 
 
 class Fetcher(object):
+    ratelimit_enabled = True
+    ratelimit_base_time = 65
+
+    ratelimit_block_size = None
+    ratelimit_last_block_time = None
+    ratelimit_remaining_queries = 2
+    ratelimit_used_queries = None
     """
     Base class for Fetchers, which wrap and normalize the APIs of various HTTP
     libraries.
 
     (It's a slightly leaky abstraction designed to make testing easier.)
     """
-    def fetch(self, client, method, url, data=None, headers=None, json=True):
+    def fetch(self, client, method, url, data=None, headers=None, json_format=True):
+        body = json.dumps(data) if json_format and data else data
+        self.wait()
+        result = self._fetch(client, method, url, body, headers)
+
+        return self.process_response(result)
+
+    def _fetch(self, client, method, url, data=None, headers=None):
         """Fetch the given request
 
         Returns
@@ -29,6 +44,33 @@ class Fetcher(object):
         status_code : int
         """
         raise NotImplementedError()
+
+    def process_response(self, response):
+        headers = response.headers
+        content = response.content
+        status = response.status_code
+
+        ratelimit = int(headers.get("X-Discogs-Ratelimit", 60))
+        used_queries = int(headers.get('X-Discogs-Ratelimit-Used', "1"))
+        remaining_queries = int(headers.get('X-Discogs-Ratelimit-Remaining', "999"))
+
+        if self.ratelimit_used_queries is None or used_queries < self.ratelimit_used_queries:
+            # ratelimit reset
+            self.ratelimit_last_block_time = time.time()
+
+        self.ratelimit_remaining_queries = remaining_queries
+        self.ratelimit_used_queries = used_queries
+        self.ratelimit_block_size = ratelimit
+
+        return content, status
+
+    def wait(self):
+        if self.ratelimit_enabled and self.ratelimit_remaining_queries <= 1:
+            elapsed_time = time.time() - self.ratelimit_last_block_time
+            time_to_wait = self.ratelimit_base_time - elapsed_time
+
+            if time_to_wait > 0:
+                time.sleep(time_to_wait)
 
 
 class LoggingDelegator(object):
@@ -48,9 +90,9 @@ class LoggingDelegator(object):
 
 class RequestsFetcher(Fetcher):
     """Fetches via HTTP from the Discogs API."""
-    def fetch(self, client, method, url, data=None, headers=None, json=True):
+    def _fetch(self, client, method, url, data=None, headers=None):
         resp = requests.request(method, url, data=data, headers=headers)
-        return resp.content, resp.status_code
+        return resp
 
 
 class UserTokenRequestsFetcher(Fetcher):
@@ -58,10 +100,11 @@ class UserTokenRequestsFetcher(Fetcher):
     def __init__(self, user_token):
         self.user_token = user_token
 
-    def fetch(self, client, method, url, data=None, headers=None, json=True):
+    def _fetch(self, client, method, url, data=None, headers=None):
         resp = requests.request(method, url, params={'token':self.user_token},
                                 data=data, headers=headers)
-        return resp.content, resp.status_code
+
+        return resp
 
 
 class OAuth2Fetcher(Fetcher):
@@ -87,13 +130,30 @@ class OAuth2Fetcher(Fetcher):
     def set_verifier(self, verifier):
         self.client.verifier = verifier
 
-    def fetch(self, client, method, url, data=None, headers=None, json_format=True):
-        body = json.dumps(data) if json_format and data else data
+    def _fetch(self, client, method, url, data=None, headers=None):
         uri, headers, body = self.client.sign(url, http_method=method,
                                               body=data, headers=headers)
 
         resp = request(method, uri, headers=headers, data=body)
-        return resp.content, resp.status_code
+
+        return resp
+
+
+class MockResponse:
+    """
+    Dummy response for mock data
+    """
+    def __init__(self, content, status_code):
+        self.content = content
+        self.status_code = status_code
+        self.headers = {
+            'X-Discogs-Ratelimit': '60',
+            'X-Discogs-Ratelimit-Used': '1',
+            'X-Discogs-Ratelimit-Remaining': '59'
+        }
+
+    def __repr__(self):
+        return "<Response: {} content: {}>".format(self.status_code, self.content)
 
 
 class FilesystemFetcher(Fetcher):
@@ -104,7 +164,7 @@ class FilesystemFetcher(Fetcher):
     def __init__(self, base_path):
         self.base_path = base_path
 
-    def fetch(self, client, method, url, data=None, headers=None, json=True):
+    def _fetch(self, client, method, url, data=None, headers=None):
         url = url.replace(client._base_url, '')
 
         if json:
@@ -124,9 +184,9 @@ class FilesystemFetcher(Fetcher):
             path = path.replace('?', '_')  # '?' is illegal in file names on Windows
             with open(path, 'r') as f:
                 content = f.read().encode('utf8')  # return bytes not unicode
-            return content, 200
+            return MockResponse(content, 200)
         except:
-            return self.default_response
+            return MockResponse(*self.default_response)
 
     def check_alternate_params(self, base_name, json):
         """
@@ -170,5 +230,6 @@ class MemoryFetcher(Fetcher):
     def __init__(self, responses):
         self.responses = responses
 
-    def fetch(self, client, method, url, data=None, headers=None, json=True):
-        return self.responses.get(url, self.default_response)
+    def _fetch(self, client, method, url, data=None, headers=None):
+        data = self.responses.get(url, self.default_response)
+        return MockResponse(*data)
